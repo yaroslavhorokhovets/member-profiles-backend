@@ -14,10 +14,11 @@ datasource db {
 }
 
 model User {
-  id       String   @id @default(uuid())
-  email    String   @unique
-  password String
-  profile  Profile?
+  id               String   @id @default(uuid())
+  email            String   @unique
+  password         String
+  stripeCustomerId String?  @unique
+  profile          Profile?
   
   followers  Follow[] @relation("FollowingRelation") // users following this user
   followings Follow[] @relation("FollowerRelation")  // users this user follows

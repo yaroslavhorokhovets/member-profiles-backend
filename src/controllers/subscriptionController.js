@@ -1,4 +1,5 @@
 const { PrismaClient } = require('@prisma/client');
+const stripe = require('../config/stripe');
 const prisma = new PrismaClient();
 
 const followUser = async (req, res) => {
@@ -180,10 +181,194 @@ const getSubscriptionStatus = async (req, res) => {
   }
 };
 
+const createPaymentIntent = async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const { amount, currency = 'usd', subscriptionType } = req.body;
+
+    if (!amount || !subscriptionType) {
+      return res.status(400).json({ error: 'Amount and subscription type are required' });
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amount * 100,
+      currency,
+      metadata: {
+        userId: userId,
+        subscriptionType: subscriptionType
+      }
+    });
+
+    res.status(200).json({
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id
+    });
+  } catch (error) {
+    console.error('Error creating payment intent:', error);
+    res.status(500).json({ error: 'Failed to create payment intent' });
+  }
+};
+
+const createCustomer = async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const { email, name } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    const customer = await stripe.customers.create({
+      email,
+      name,
+      metadata: {
+        userId: userId
+      }
+    });
+
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { stripeCustomerId: customer.id }
+    });
+
+    res.status(201).json({
+      customerId: customer.id,
+      message: 'Customer created successfully'
+    });
+  } catch (error) {
+    console.error('Error creating Stripe customer:', error);
+    res.status(500).json({ error: 'Failed to create customer' });
+  }
+};
+
+const createSubscription = async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const { priceId, paymentMethodId } = req.body;
+
+    if (!priceId || !paymentMethodId) {
+      return res.status(400).json({ error: 'Price ID and payment method ID are required' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!user.stripeCustomerId) {
+      return res.status(400).json({ error: 'Customer not found. Please create a customer first.' });
+    }
+
+    const subscription = await stripe.subscriptions.create({
+      customer: user.stripeCustomerId,
+      items: [{ price: priceId }],
+      default_payment_method: paymentMethodId,
+      expand: ['latest_invoice.payment_intent']
+    });
+
+    res.status(201).json({
+      subscriptionId: subscription.id,
+      status: subscription.status,
+      subscription
+    });
+  } catch (error) {
+    console.error('Error creating subscription:', error);
+    res.status(500).json({ error: 'Failed to create subscription' });
+  }
+};
+
+const cancelSubscription = async (req, res) => {
+  try {
+    const { subscriptionId } = req.params;
+
+    if (!subscriptionId) {
+      return res.status(400).json({ error: 'Subscription ID is required' });
+    }
+
+    const subscription = await stripe.subscriptions.update(subscriptionId, {
+      cancel_at_period_end: true
+    });
+
+    res.status(200).json({
+      message: 'Subscription will be cancelled at the end of the current period',
+      subscription
+    });
+  } catch (error) {
+    console.error('Error cancelling subscription:', error);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
+};
+
+const getPaymentMethods = async (req, res) => {
+  try {
+    const { userId } = req.user;
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!user.stripeCustomerId) {
+      return res.status(400).json({ error: 'Customer not found' });
+    }
+
+    const paymentMethods = await stripe.paymentMethods.list({
+      customer: user.stripeCustomerId,
+      type: 'card'
+    });
+
+    res.status(200).json({
+      paymentMethods: paymentMethods.data
+    });
+  } catch (error) {
+    console.error('Error getting payment methods:', error);
+    res.status(500).json({ error: 'Failed to get payment methods' });
+  }
+};
+
+const webhookHandler = async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      const paymentIntent = event.data.object;
+      console.log('Payment succeeded:', paymentIntent.id);
+      break;
+    case 'customer.subscription.created':
+      const subscription = event.data.object;
+      console.log('Subscription created:', subscription.id);
+      break;
+    case 'customer.subscription.updated':
+      const updatedSubscription = event.data.object;
+      console.log('Subscription updated:', updatedSubscription.id);
+      break;
+    case 'customer.subscription.deleted':
+      const deletedSubscription = event.data.object;
+      console.log('Subscription deleted:', deletedSubscription.id);
+      break;
+    default:
+      console.log(`Unhandled event type ${event.type}`);
+  }
+
+  res.json({ received: true });
+};
+
 module.exports = {
   followUser,
   unfollowUser,
   getFollowers,
   getFollowing,
-  getSubscriptionStatus
+  getSubscriptionStatus,
+  createPaymentIntent,
+  createCustomer,
+  createSubscription,
+  cancelSubscription,
+  getPaymentMethods,
+  webhookHandler
 };
